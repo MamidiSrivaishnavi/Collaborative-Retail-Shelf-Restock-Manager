@@ -1,1 +1,1 @@
-# retail_agent_v2
+# Collaborative Retail Shelf Restock Manager
