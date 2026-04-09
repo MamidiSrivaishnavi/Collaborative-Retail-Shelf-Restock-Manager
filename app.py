@@ -2,15 +2,27 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
-import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
 import faiss
 from dotenv import load_dotenv
 
+# Try new library first, fallback to old
+try:
+    from google import genai
+    from google.genai import types
+    USE_NEW_SDK = True
+except ImportError:
+    import google.generativeai as genai
+    USE_NEW_SDK = False
+
 # --- 1. CONFIGURATION & SETUP ---
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=api_key)
+
+if USE_NEW_SDK:
+    client = genai.Client(api_key=api_key)
+else:
+    genai.configure(api_key=api_key)
 
 st.set_page_config(page_title="Retail AI: Intelligence Dashboard", layout="wide")
 
@@ -68,12 +80,25 @@ def get_inventory_data(uploaded_file):
         status = "URGENT" if days_left < 2.5 else "STABLE"
         target_qty = avg_sales * 7
         order_qty = max(0, round(target_qty - current_stock))
-
-        results.append({
-            "Store": sid, "Product": pid, "Category": row['Category'],
-            "Stock": int(current_stock), "Daily Sales": round(avg_sales, 1),
-            "Status": status, "Order Qty": order_qty, "Cost (INR)": round(order_qty * row['Price'], 2)
-        })
+        
+        # Build result dict dynamically - keep ALL original columns
+        result = {
+            "Store": sid, 
+            "Product": pid, 
+            "Category": row['Category'],
+            "Stock": int(current_stock), 
+            "Daily Sales": round(avg_sales, 1),
+            "Status": status, 
+            "Order Qty": order_qty, 
+            "Cost (INR)": round(order_qty * row['Price'], 2)
+        }
+        
+        # Add ALL other columns from original dataset dynamically
+        for col in current_df.columns:
+            if col not in ['Date', 'Store ID', 'Product ID', 'Category', 'Inventory Level', 'Units Sold']:
+                result[col] = row[col]
+        
+        results.append(result)
     return pd.DataFrame(results)
 
 # --- 3. VECTOR SEARCH ENGINE (FAISS) ---
@@ -125,26 +150,108 @@ if uploaded_file:
         
         if st.button("Generate AI Answer"):
             if query:
-                with st.spinner("Searching vectors..."):
-                    index, text_descriptions = build_search_index(data)
-                    query_vec = embedder.encode([query])
-                    dist, indices = index.search(np.array(query_vec).astype('float32'), k=3)
+                with st.spinner("Analyzing query..."):
+                    # Let AI decide if it needs full data or semantic search
+                    query_lower = query.lower()
                     
-                    context = "\n".join([text_descriptions[i] for i in indices[0]])
-                    top_row_idx = indices[0][0]
+                    # Simple heuristic: if asking about multiple stores, categories, or comparisons -> use full data
+                    # Otherwise use semantic search for speed
+                    needs_full_context = any([
+                        'all' in query_lower and ('store' in query_lower or 'product' in query_lower or 'item' in query_lower),
+                        'compare' in query_lower,
+                        'total' in query_lower,
+                        'which' in query_lower and ('store' in query_lower or 'category' in query_lower),
+                        'across' in query_lower,
+                        'every' in query_lower,
+                        query_lower.count('s00') > 1,  # Multiple stores mentioned
+                        'p00' in query_lower and 'across' in query_lower  # Product across stores
+                    ])
+                    
+                    if needs_full_context:
+                        # Provide ALL data with ALL columns dynamically
+                        context_lines = []
+                        for _, row in data.iterrows():
+                            # Build context string with all available columns
+                            row_info = f"Store {row['Store']} - Product {row['Product']} ({row['Category']}): "
+                            row_info += f"Status={row['Status']}, Stock={row['Stock']}, Order Qty={row['Order Qty']}, Cost=₹{row['Cost (INR)']}"
+                            
+                            # Add all other columns dynamically
+                            for col in data.columns:
+                                if col not in ['Store', 'Product', 'Category', 'Status', 'Stock', 'Order Qty', 'Cost (INR)', 'Daily Sales']:
+                                    row_info += f", {col}={row[col]}"
+                            
+                            context_lines.append(row_info)
+                        
+                        context = "\n".join(context_lines)
+                        st.caption("🔍 Analyzing full dataset...")
+                    else:
+                        # Use FAISS for targeted search with all columns
+                        index, _ = build_search_index(data)
+                        query_vec = embedder.encode([query])
+                        _, indices = index.search(np.array(query_vec).astype('float32'), k=10)
+                        
+                        context_lines = []
+                        for i in indices[0]:
+                            row = data.iloc[i]
+                            row_info = f"Store {row['Store']} - Product {row['Product']} ({row['Category']}): "
+                            row_info += f"Status={row['Status']}, Stock={row['Stock']}, Order Qty={row['Order Qty']}, Cost=₹{row['Cost (INR)']}"
+                            
+                            # Add all other columns dynamically
+                            for col in data.columns:
+                                if col not in ['Store', 'Product', 'Category', 'Status', 'Stock', 'Order Qty', 'Cost (INR)', 'Daily Sales']:
+                                    row_info += f", {col}={row[col]}"
+                            
+                            context_lines.append(row_info)
+                        
+                        context = "\n".join(context_lines)
+                        st.caption("🔍 Using semantic search...")
+                    
+                    top_row_idx = 0
                     top_row = data.iloc[top_row_idx]
 
                     try:
-                        model = genai.GenerativeModel("gemini-1.5-flash")
-                        response = model.generate_content(f"You are a retail manager. Data:\n{context}\n\nUser: {query}")
+                        import time
+                        # Try multiple models in order of preference (lightest first to save quota)
+                        models_to_try = [
+                            'models/gemini-flash-lite-latest',  # Lightest, fastest
+                            'models/gemini-2.0-flash-lite',
+                            'models/gemini-2.5-flash'
+                        ]
+                        
+                        response = None
+                        for model_name in models_to_try:
+                            try:
+                                if USE_NEW_SDK:
+                                    response = client.models.generate_content(
+                                        model=model_name,
+                                        contents=f"You are a retail manager. Data:\n{context}\n\nUser: {query}"
+                                    )
+                                else:
+                                    model = genai.GenerativeModel(model_name.replace('models/', ''))
+                                    response = model.generate_content(f"You are a retail manager. Data:\n{context}\n\nUser: {query}")
+                                
+                                st.write("### AI Insights")
+                                st.success(response.text)
+                                st.caption(f"✨ Powered by {model_name}")
+                                break
+                                
+                            except Exception as model_error:
+                                if "503" in str(model_error):
+                                    st.warning(f"⏳ {model_name} is busy, trying next model...")
+                                    time.sleep(1)
+                                    continue
+                                else:
+                                    raise model_error
+                        
+                        if not response:
+                            raise Exception("All models unavailable")
+                            
+                    except Exception as e:
                         st.write("### AI Insights")
-                        st.info(response.text)
-                    except Exception:
-                        st.write("### AI Insights")
-                        st.warning("⚠️ Running in Offline Intelligence Mode")
+                        st.warning("⚠️ AI service temporarily unavailable. Using local analysis...")
                         st.info(f"""
-                        **Analysis:** The most relevant item is **{top_row['Product']}** in **Store {top_row['Store']}**. 
-                        Current status is **{top_row['Status']}**. Recommended order: **{top_row['Order Qty']}** units (Cost: **₹{top_row['Cost (INR)']:,.2f}**).
+                        **Analysis:** The most relevant item is **{data.iloc[0]['Product']}** in **Store {data.iloc[0]['Store']}**. 
+                        Current status is **{data.iloc[0]['Status']}**. Recommended order: **{data.iloc[0]['Order Qty']}** units (Cost: **₹{data.iloc[0]['Cost (INR)']:,.2f}**).
                         """)
             else:
                 st.warning("Please enter a question first.")
